@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,12 +20,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -41,6 +44,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -232,14 +236,54 @@ private fun EditScreen(vm: AppVM, ref: ListRef, data: ListData) {
     }
 }
 
-/** 항목을 꾹 누른 뒤 끌어서 순서 변경. 오른쪽 ⊖ 는 목록에서 빼기 */
+/** 항목을 꾹 누른 뒤 끌어서 순서 변경(화면 끝에 닿으면 목록이 저절로 스크롤). 오른쪽 ⊖ 는 목록에서 빼기 */
 @Composable
 private fun ReorderList(items: SnapshotStateList<Item>, vm: AppVM, modifier: Modifier) {
     val rowPx = with(LocalDensity.current) { 64.dp.toPx() }
+    val listState = rememberLazyListState()
     var dragKey by remember { mutableStateOf<String?>(null) }
     var dragY by remember { mutableFloatStateOf(0f) }
 
-    LazyColumn(modifier) {
+    fun settle(k: String) {
+        var guard = 0
+        while (guard++ < 6) {
+            val i = items.indexOfFirst { it.type + it.id == k }
+            if (i < 0) return
+            if (dragY > rowPx / 2 && i < items.lastIndex) {
+                items.add(i + 1, items.removeAt(i))
+                dragY -= rowPx
+            } else if (dragY < -rowPx / 2 && i > 0) {
+                items.add(i - 1, items.removeAt(i))
+                dragY += rowPx
+            } else {
+                return
+            }
+        }
+    }
+
+    // 끌고 있는 항목이 위/아래 끝에 가까우면 손을 안 움직여도 목록이 스크롤된다
+    LaunchedEffect(dragKey) {
+        val k = dragKey ?: return@LaunchedEffect
+        while (true) {
+            val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == k }
+            if (info != null) {
+                val center = info.offset + dragY + info.size / 2f
+                val end = listState.layoutInfo.viewportEndOffset.toFloat()
+                val delta = when {
+                    center > end - rowPx -> 16f
+                    center < rowPx -> -16f
+                    else -> 0f
+                }
+                if (delta != 0f) {
+                    dragY += listState.scrollBy(delta)
+                    settle(k)
+                }
+            }
+            delay(16)
+        }
+    }
+
+    LazyColumn(modifier, state = listState) {
         itemsIndexed(items, key = { _, it -> it.type + it.id }) { index, item ->
             val k = item.type + item.id
             val dragging = dragKey == k
@@ -257,16 +301,7 @@ private fun ReorderList(items: SnapshotStateList<Item>, vm: AppVM, modifier: Mod
                             onDrag = { change, amount ->
                                 change.consume()
                                 dragY += amount.y
-                                val i = items.indexOfFirst { it.type + it.id == k }
-                                if (i >= 0) {
-                                    if (dragY > rowPx / 2 && i < items.lastIndex) {
-                                        items.add(i + 1, items.removeAt(i))
-                                        dragY -= rowPx
-                                    } else if (dragY < -rowPx / 2 && i > 0) {
-                                        items.add(i - 1, items.removeAt(i))
-                                        dragY += rowPx
-                                    }
-                                }
+                                settle(k)
                             },
                             onDragEnd = {
                                 dragKey = null

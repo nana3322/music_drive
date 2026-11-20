@@ -2,6 +2,7 @@ package com.driveplayer.music
 
 import android.app.Application
 import android.content.ComponentName
+import android.os.Bundle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -13,8 +14,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
+import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionToken
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -26,14 +29,23 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.util.UUID
+import kotlin.random.Random
 
 class AppVM(app: Application) : AndroidViewModel(app) {
     val store = Store(app)
+
+    private fun isConfigured() = store.apiKey.isNotBlank() && parseFolderId(store.folderLink).isNotBlank()
+
+    /** 폴더 링크와 API 키가 저장되어 있는지(처음 실행 안내용) */
+    var configured by mutableStateOf(isConfigured())
+
     var repo: MusicRepo = makeRepo()
         private set
 
-    private fun makeRepo(): MusicRepo =
-        DriveRepo(store.apiKey.trim(), parseFolderId(store.folderLink))
+    private fun makeRepo(): MusicRepo {
+        val app = getApplication<Application>()
+        return DriveRepo(app, store.apiKey.trim(), parseFolderId(store.folderLink), AppSig.headers(app))
+    }
 
     // ---------------------------------------------------------------- 탐색
     var tab by mutableIntStateOf(0)
@@ -284,6 +296,27 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         tab = 1
     }
 
+    // ---------------------------------------------------------------- 목록 내보내기 / 가져오기
+    fun exportJson(): String = store.exportAll(playlists, folderLists, favorites)
+
+    /** 같은 목록(같은 ID)은 가져온 것으로 바뀌고, 나머지는 그대로 두고 추가한다 */
+    fun importAll(text: String) {
+        val r = store.parseAll(text)
+        if (r == null) {
+            toast = "가져올 수 없는 파일이에요"
+            return
+        }
+        fun merge(cur: List<ListData>, inc: List<ListData>): List<ListData> {
+            val ids = inc.map { it.id }.toSet()
+            return cur.filter { it.id !in ids } + inc
+        }
+        setLists(false, merge(playlists, r.first))
+        setLists(true, merge(folderLists, r.second))
+        favorites = favorites + r.third.filter { f -> favorites.none { it.id == f.id } }
+        store.saveItems("favs", favorites)
+        toast = "재생목록 ${r.first.size}개, 폴더 목록 ${r.second.size}개를 가져왔어요"
+    }
+
     // ---------------------------------------------------------------- 가수(ID3)
     val artists = mutableStateMapOf<String, String>()
     private val artistSem = Semaphore(3)
@@ -315,6 +348,10 @@ class AppVM(app: Application) : AndroidViewModel(app) {
     var expanded by mutableStateOf(false)
     var cacheUsed by mutableLongStateOf(0L)
 
+    /** 취침·수업 타이머: 끝나는 시각(0이면 꺼짐)과 남은 시간 */
+    var timerEndMs by mutableLongStateOf(0L)
+    var timerLeftMs by mutableLongStateOf(0L)
+
     val current: Song? get() = queue.getOrNull(curIndex)
 
     private var controller: MediaController? = null
@@ -324,12 +361,18 @@ class AppVM(app: Application) : AndroidViewModel(app) {
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             this@AppVM.isPlaying = isPlaying
+            if (!isPlaying) {
+                controller?.let { store.saveLastPos(it.currentMediaItemIndex, it.currentPosition) }
+            }
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             controller?.let {
                 curIndex = it.currentMediaItemIndex
                 posMs = 0L
+                if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
+                    store.saveLastPos(it.currentMediaItemIndex, 0L)
+                }
             }
         }
 
@@ -350,6 +393,27 @@ class AppVM(app: Application) : AndroidViewModel(app) {
             val id = controller?.currentMediaItem?.mediaId
             if (!a.isNullOrBlank() && !id.isNullOrBlank()) artists[id] = a
         }
+
+        override fun onPlayerError(error: PlaybackException) {
+            toast = "재생할 수 없는 곡은 건너뛰어요"
+        }
+    }
+
+    private fun buildItems(list: List<Song>): List<MediaItem> {
+        val r = repo
+        return list.map { s ->
+            MediaItem.Builder()
+                .setMediaId(s.id)
+                .setUri(r.streamUri(s.id))
+                .setCustomCacheKey(s.id)
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(titleOf(s.name))
+                        .setArtist(artists[s.id])
+                        .build()
+                )
+                .build()
+        }
     }
 
     private fun syncFrom(c: MediaController) {
@@ -364,7 +428,22 @@ class AppVM(app: Application) : AndroidViewModel(app) {
             curIndex = c.currentMediaItemIndex
             posMs = c.currentPosition
             durMs = c.duration.coerceAtLeast(0L)
+        } else {
+            restoreLast(c)
         }
+    }
+
+    /** 앱이 꺼졌다 켜져도 마지막에 듣던 목록·곡·위치를 다시 불러온다(재생 버튼을 누르기 전까진 데이터를 쓰지 않음) */
+    private fun restoreLast(c: MediaController) {
+        if (!configured) return
+        val q = store.loadLastQueue()
+        if (q.isEmpty()) return
+        val idx = store.lastIndex.coerceIn(0, q.lastIndex)
+        val pos = store.lastPos
+        c.setMediaItems(buildItems(q), idx, pos)
+        queue = q
+        curIndex = idx
+        posMs = pos
     }
 
     private fun withController(block: (MediaController) -> Unit) {
@@ -385,6 +464,11 @@ class AppVM(app: Application) : AndroidViewModel(app) {
                     queue = emptyList()
                     isPlaying = false
                     expanded = false
+                    timerEndMs = 0L
+                }
+
+                override fun onExtrasChanged(controller: MediaController, extras: Bundle) {
+                    timerEndMs = extras.getLong("timerEnd", 0L)
                 }
             })
             .buildAsync()
@@ -394,6 +478,7 @@ class AppVM(app: Application) : AndroidViewModel(app) {
                 val mc = f.get()
                 mc.addListener(playerListener)
                 controller = mc
+                timerEndMs = mc.sessionExtras.getLong("timerEnd", 0L)
                 syncFrom(mc)
                 val run = ArrayList(pending)
                 pending.clear()
@@ -405,33 +490,23 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         }, ContextCompat.getMainExecutor(app))
     }
 
-    fun playSongs(list: List<Song>, start: Int = 0) {
+    /** shuffleMode=true면 목록 순서는 그대로 두고 재생 순서만 섞는다(플레이어의 셔플 기능) */
+    fun playSongs(list: List<Song>, start: Int = 0, shuffleMode: Boolean = false) {
         if (list.isEmpty()) {
             toast = "재생할 곡이 없어요"
             return
         }
-        val r = repo
         val s0 = start.coerceIn(0, list.lastIndex)
         withController { c ->
-            val items = list.map { s ->
-                MediaItem.Builder()
-                    .setMediaId(s.id)
-                    .setUri(r.streamUri(s.id))
-                    .setCustomCacheKey(s.id)
-                    .setMediaMetadata(
-                        MediaMetadata.Builder()
-                            .setTitle(titleOf(s.name))
-                            .setArtist(artists[s.id])
-                            .build()
-                    )
-                    .build()
-            }
-            c.setMediaItems(items, s0, 0L)
+            c.setMediaItems(buildItems(list), s0, 0L)
+            c.shuffleModeEnabled = shuffleMode
             c.prepare()
             c.play()
             queue = list
             curIndex = s0
             posMs = 0L
+            store.saveLastQueue(list)
+            store.saveLastPos(s0, 0L)
         }
     }
 
@@ -470,7 +545,8 @@ class AppVM(app: Application) : AndroidViewModel(app) {
                     if (item.type == "song") songs.add(Song(item.id, item.name))
                     else songs.addAll(repo.songsIn(item.id))
                 }
-                if (shuffleIt) playSongs(songs.shuffled(), 0) else playSongs(songs, startIdx)
+                if (shuffleIt && songs.isNotEmpty()) playSongs(songs, Random.nextInt(songs.size), true)
+                else playSongs(songs, startIdx, false)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -480,11 +556,21 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun playPause() = withController { if (it.isPlaying) it.pause() else it.play() }
+    fun playPause() = withController {
+        if (it.isPlaying) {
+            it.pause()
+        } else {
+            if (it.playbackState == Player.STATE_IDLE) it.prepare()
+            it.play()
+        }
+    }
+
     fun next() = withController { it.seekToNextMediaItem() }
     fun prev() = withController { it.seekToPrevious() }
     fun restart() = withController { it.seekTo(0L) }
+
     fun seekToIndex(i: Int) = withController {
+        if (it.playbackState == Player.STATE_IDLE) it.prepare()
         it.seekToDefaultPosition(i)
         it.play()
     }
@@ -503,6 +589,18 @@ class AppVM(app: Application) : AndroidViewModel(app) {
 
     fun toggleShuffle() = withController { it.shuffleModeEnabled = !it.shuffleModeEnabled }
 
+    /** 0이면 타이머 끄기. 타이머는 재생 서비스에서 돌아서 화면을 꺼도 동작한다 */
+    fun setSleepTimer(min: Int) {
+        timerEndMs = if (min > 0) System.currentTimeMillis() + min * 60_000L else 0L
+        withController { c ->
+            c.sendCustomCommand(
+                SessionCommand(PlayerService.CMD_TIMER, Bundle.EMPTY),
+                Bundle().apply { putInt("min", min) }
+            )
+        }
+        toast = if (min > 0) "${min}분 뒤에 멈춰요" else "타이머를 껐어요"
+    }
+
     // ---------------------------------------------------------------- 설정 / 캐시
     fun applySettings(link: String, key: String) {
         if (key.isBlank() || parseFolderId(link).isBlank()) {
@@ -511,6 +609,7 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         }
         store.folderLink = link.trim()
         store.apiKey = key.trim()
+        configured = true
         repo = makeRepo()
         reloadRoot()
         tab = 0
@@ -540,6 +639,7 @@ class AppVM(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         store.saveArtists(artists.toMap())
+        controller?.let { store.saveLastPos(it.currentMediaItemIndex, it.currentPosition) }
         super.onCleared()
     }
 
@@ -548,14 +648,21 @@ class AppVM(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { CacheManager.purgeOld(getApplication<Application>()) }
         withController { }
         reloadRoot()
+        // 처음 실행(링크·키 없음)이면 설정 탭부터 연다
+        if (!configured) tab = 2
         viewModelScope.launch {
+            var tick = 0
             while (isActive) {
                 delay(500)
+                tick++
                 val c = controller
                 if (c != null && c.isConnected && isPlaying) {
                     posMs = c.currentPosition
                     durMs = c.duration.coerceAtLeast(0L)
+                    if (tick % 10 == 0) store.saveLastPos(c.currentMediaItemIndex, c.currentPosition)
                 }
+                timerLeftMs = if (timerEndMs > 0L) (timerEndMs - System.currentTimeMillis()).coerceAtLeast(0L) else 0L
+                if (timerEndMs > 0L && timerLeftMs == 0L) timerEndMs = 0L
             }
         }
     }

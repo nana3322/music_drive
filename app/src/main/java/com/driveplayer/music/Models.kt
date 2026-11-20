@@ -57,6 +57,20 @@ class Store(ctx: Context) {
             Item(o.getString("t"), o.getString("id"), o.getString("n"))
         }
 
+    private fun listsToJson(lists: List<ListData>): JSONArray {
+        val arr = JSONArray()
+        lists.forEach {
+            arr.put(JSONObject().put("id", it.id).put("name", it.name).put("items", itemsToJson(it.items)))
+        }
+        return arr
+    }
+
+    private fun jsonToLists(a: JSONArray): List<ListData> =
+        (0 until a.length()).map {
+            val o = a.getJSONObject(it)
+            ListData(o.getString("id"), o.getString("name"), jsonToItems(o.getJSONArray("items")))
+        }
+
     fun saveItems(key: String, items: List<Item>) {
         sp.edit().putString(key, itemsToJson(items).toString()).apply()
     }
@@ -68,19 +82,11 @@ class Store(ctx: Context) {
     }
 
     fun saveLists(key: String, lists: List<ListData>) {
-        val arr = JSONArray()
-        lists.forEach {
-            arr.put(JSONObject().put("id", it.id).put("name", it.name).put("items", itemsToJson(it.items)))
-        }
-        sp.edit().putString(key, arr.toString()).apply()
+        sp.edit().putString(key, listsToJson(lists).toString()).apply()
     }
 
     fun loadLists(key: String): List<ListData> = try {
-        val a = JSONArray(sp.getString(key, "[]"))
-        (0 until a.length()).map {
-            val o = a.getJSONObject(it)
-            ListData(o.getString("id"), o.getString("name"), jsonToItems(o.getJSONArray("items")))
-        }
+        jsonToLists(JSONArray(sp.getString(key, "[]")))
     } catch (e: Exception) {
         emptyList()
     }
@@ -98,5 +104,52 @@ class Store(ctx: Context) {
         out
     } catch (e: Exception) {
         emptyMap()
+    }
+
+    // ---- 마지막 재생(이어 듣기)
+    fun saveLastQueue(q: List<Song>) {
+        val a = JSONArray()
+        q.forEach { a.put(JSONObject().put("id", it.id).put("n", it.name)) }
+        sp.edit().putString("lastQ", a.toString()).apply()
+    }
+
+    fun loadLastQueue(): List<Song> = try {
+        val a = JSONArray(sp.getString("lastQ", "[]"))
+        (0 until a.length()).map {
+            val o = a.getJSONObject(it)
+            Song(o.getString("id"), o.getString("n"))
+        }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    fun saveLastPos(index: Int, pos: Long) {
+        sp.edit().putInt("lastI", index).putLong("lastP", pos).apply()
+    }
+
+    val lastIndex: Int get() = sp.getInt("lastI", 0)
+    val lastPos: Long get() = sp.getLong("lastP", 0L)
+
+    // ---- 목록 내보내기 / 가져오기
+    fun exportAll(pl: List<ListData>, fl: List<ListData>, favs: List<Item>): String {
+        val o = JSONObject()
+        o.put("app", "drivemusic")
+        o.put("version", 1)
+        o.put("playlists", listsToJson(pl))
+        o.put("folderLists", listsToJson(fl))
+        o.put("favorites", itemsToJson(favs))
+        return o.toString(2)
+    }
+
+    fun parseAll(text: String): Triple<List<ListData>, List<ListData>, List<Item>>? = try {
+        val o = JSONObject(text)
+        if (o.optString("app") != "drivemusic") null
+        else Triple(
+            jsonToLists(o.optJSONArray("playlists") ?: JSONArray()),
+            jsonToLists(o.optJSONArray("folderLists") ?: JSONArray()),
+            jsonToItems(o.optJSONArray("favorites") ?: JSONArray())
+        )
+    } catch (e: Exception) {
+        null
     }
 }

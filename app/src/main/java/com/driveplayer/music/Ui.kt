@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -110,6 +111,7 @@ object Ic {
     val Replay = mk("replay", "M3 12a9 9 0 1 0 3-6.7M3 4v5h5")
     val Queue = mk("queue", "M4 6h12M4 12h12M4 18h7M18 14v6M15 17h6")
     val Sliders = mk("sliders", "M4 7h9M17 7h3M4 17h3M11 17h9M17 7a2 2 0 1 0-4 0a2 2 0 1 0 4 0M11 17a2 2 0 1 0-4 0a2 2 0 1 0 4 0")
+    val Timer = mk("timer", "M21 12a9 9 0 1 0-18 0a9 9 0 1 0 18 0M12 7v5l3 2")
     val Heart = mk("heart", "M12 20s-7-4.6-7-10a4 4 0 0 1 7-2.5A4 4 0 0 1 19 10c0 5.4-7 10-7 10z")
 }
 
@@ -328,7 +330,7 @@ fun App(vm: AppVM) {
     BackHandler(enabled = vm.picker != null) { vm.cancelPicker() }
     BackHandler(enabled = vm.expanded) { vm.expanded = false }
 
-    Box(Modifier.fillMaxSize().background(BG).systemBarsPadding()) {
+    Box(Modifier.fillMaxSize().background(BG).systemBarsPadding().imePadding()) {
         Column(Modifier.fillMaxSize()) {
             Box(Modifier.weight(1f)) {
                 when (vm.tab) {
@@ -462,7 +464,7 @@ fun AddSheet(vm: AppVM) {
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = Surface1
     ) {
-        Column(Modifier.navigationBarsPadding().padding(bottom = 12.dp)) {
+        Column(Modifier.navigationBarsPadding().imePadding().padding(bottom = 12.dp)) {
             Row(Modifier.padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Tile(if (allFolders) Ic.Folder else Ic.Note, 48.dp, if (allFolders) Accent else Sub)
                 Spacer(Modifier.width(12.dp))

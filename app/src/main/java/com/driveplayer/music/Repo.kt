@@ -1,15 +1,28 @@
 package com.driveplayer.music
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
+import java.net.ConnectException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
+import java.net.UnknownHostException
 import java.nio.charset.Charset
+import java.security.MessageDigest
 
 interface MusicRepo {
     val rootId: String
@@ -62,18 +75,114 @@ fun parseFolderId(link: String): String {
     return if (s.startsWith("http")) "" else s
 }
 
+// ------------------------------------------------------------------ 앱 정보(API 키의 '내 앱에서만 쓰기' 제한용)
+
+object AppSig {
+    private var cached: Map<String, String>? = null
+
+    /** 구글에 같이 보내는 앱 정보: 패키지 이름 + 서명 지문(SHA-1, 콜론 없는 대문자) */
+    @Suppress("DEPRECATION")
+    @Synchronized
+    fun headers(ctx: Context): Map<String, String> {
+        cached?.let { return it }
+        val pkg = ctx.packageName
+        val m = HashMap<String, String>()
+        m["X-Android-Package"] = pkg
+        try {
+            val pm = ctx.packageManager
+            val bytes: ByteArray? = if (Build.VERSION.SDK_INT >= 28) {
+                val info = pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES)
+                info.signingInfo?.apkContentsSigners?.firstOrNull()?.toByteArray()
+            } else {
+                val info = pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES)
+                info.signatures?.firstOrNull()?.toByteArray()
+            }
+            if (bytes != null) {
+                val md = MessageDigest.getInstance("SHA-1").digest(bytes)
+                m["X-Android-Cert"] = md.joinToString("") { "%02X".format(it) }
+            }
+        } catch (e: Exception) {
+            // 지문을 못 읽어도 앱은 동작(제한을 안 건 키라면 문제 없음)
+        }
+        cached = m
+        return m
+    }
+}
+
 // ------------------------------------------------------------------ Google Drive (공유 링크 + API 키)
 
-class DriveRepo(private val key: String, private val root: String) : MusicRepo {
+class DriveRepo(
+    private val ctx: Context,
+    private val key: String,
+    private val root: String,
+    private val headers: Map<String, String>
+) : MusicRepo {
     override val rootId: String get() = root
     override val rootName: String get() = "내 음악"
 
     private val cache = HashMap<String, List<Node>>()
     private var index: List<Node>? = null
 
+    // 폴더 목록을 기기에 저장해 두면 인터넷이 없어도 열리고, 검색 목록도 여기서 만들어진다
+    private val cacheFile: File? =
+        if (root.isBlank()) null
+        else File(ctx.filesDir, "drive_cache_" + root.replace(Regex("[^A-Za-z0-9_-]"), "") + ".json")
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var saveJob: Job? = null
+
+    init {
+        loadCache()
+    }
+
+    private fun loadCache() {
+        val f = cacheFile ?: return
+        if (!f.exists()) return
+        try {
+            val o = JSONObject(f.readText())
+            val m = HashMap<String, List<Node>>()
+            o.keys().forEach { k ->
+                val a = o.getJSONArray(k)
+                m[k] = (0 until a.length()).map { i ->
+                    val e = a.getJSONObject(i)
+                    Node(e.getString("i"), e.getString("n"), e.getInt("f") == 1)
+                }
+            }
+            synchronized(cache) { cache.putAll(m) }
+        } catch (e: Exception) {
+            // 깨진 저장분은 무시하고 새로 받는다
+        }
+    }
+
+    private fun scheduleSave() {
+        val f = cacheFile ?: return
+        saveJob?.cancel()
+        saveJob = scope.launch {
+            delay(1500)
+            try {
+                val snap = synchronized(cache) { HashMap(cache) }
+                val o = JSONObject()
+                snap.forEach { (k, v) ->
+                    val a = JSONArray()
+                    v.forEach { n ->
+                        a.put(JSONObject().put("i", n.id).put("n", n.name).put("f", if (n.isFolder) 1 else 0))
+                    }
+                    o.put(k, a)
+                }
+                val tmp = File(f.parentFile, f.name + ".tmp")
+                tmp.writeText(o.toString())
+                tmp.renameTo(f)
+            } catch (e: Exception) {
+                // 저장 실패는 다음 기회에
+            }
+        }
+    }
+
+    /** 새로 불러오기: 저장해 둔 폴더·검색 목록을 모두 지운다 */
     override fun refresh() {
+        saveJob?.cancel()
         synchronized(cache) { cache.clear() }
         index = null
+        try { cacheFile?.delete() } catch (e: Exception) { }
     }
 
     override fun streamUri(songId: String): Uri =
@@ -84,10 +193,10 @@ class DriveRepo(private val key: String, private val root: String) : MusicRepo {
             Regex(".*\\.(mp3|m4a|aac|flac|wav|ogg|opus)$", RegexOption.IGNORE_CASE).matches(name)
 
     override suspend fun list(folderId: String): List<Node> = withContext(Dispatchers.IO) {
+        synchronized(cache) { cache[folderId] }?.let { return@withContext it }
         if (key.isBlank() || root.isBlank()) {
             throw IOException("설정에서 폴더 링크와 API 키를 입력해 주세요")
         }
-        synchronized(cache) { cache[folderId] }?.let { return@withContext it }
         val out = ArrayList<Node>()
         var token: String? = null
         do {
@@ -113,6 +222,7 @@ class DriveRepo(private val key: String, private val root: String) : MusicRepo {
         } while (token != null)
         val sorted = sortNodes(out)
         synchronized(cache) { cache[folderId] = sorted }
+        scheduleSave()
         sorted
     }
 
@@ -133,6 +243,7 @@ class DriveRepo(private val key: String, private val root: String) : MusicRepo {
         return idx.filter { it.name.lowercase().contains(q) }.take(200)
     }
 
+    /** 저장해 둔 폴더 목록에서 만들기 때문에 처음 한 번만 오래 걸리고, 이후엔 인터넷 없이 빠르다 */
     private suspend fun buildIndex(): List<Node> {
         val out = ArrayList<Node>()
         suspend fun walk(id: String) {
@@ -152,6 +263,7 @@ class DriveRepo(private val key: String, private val root: String) : MusicRepo {
             c.connectTimeout = 8000
             c.readTimeout = 8000
             c.setRequestProperty("Range", "bytes=0-65535")
+            headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
             val code = c.responseCode
             if (code != 200 && code != 206) {
                 c.disconnect()
@@ -174,15 +286,24 @@ class DriveRepo(private val key: String, private val root: String) : MusicRepo {
     }
 
     private fun httpGet(url: String): String {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.connectTimeout = 15000
-        c.readTimeout = 20000
-        val code = c.responseCode
-        val body = (if (code in 200..299) c.inputStream else c.errorStream)
-            ?.bufferedReader()?.use { it.readText() } ?: ""
-        c.disconnect()
-        if (code !in 200..299) throw IOException(explain(code, body))
-        return body
+        try {
+            val c = URL(url).openConnection() as HttpURLConnection
+            c.connectTimeout = 15000
+            c.readTimeout = 20000
+            headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
+            val code = c.responseCode
+            val body = (if (code in 200..299) c.inputStream else c.errorStream)
+                ?.bufferedReader()?.use { it.readText() } ?: ""
+            c.disconnect()
+            if (code !in 200..299) throw IOException(explain(code, body))
+            return body
+        } catch (e: UnknownHostException) {
+            throw IOException("인터넷에 연결되어 있지 않아요")
+        } catch (e: ConnectException) {
+            throw IOException("인터넷에 연결되어 있지 않아요")
+        } catch (e: SocketTimeoutException) {
+            throw IOException("인터넷 연결이 불안정해요. 잠시 뒤 다시 시도하세요")
+        }
     }
 
     private fun explain(code: Int, body: String): String {
@@ -193,7 +314,7 @@ class DriveRepo(private val key: String, private val root: String) : MusicRepo {
         }
         return when (code) {
             400 -> "요청 오류(400): API 키와 폴더 링크를 확인하세요 ($msg)"
-            403 -> "접근 거부(403): API 키 제한 또는 Drive API 사용 설정을 확인하세요 ($msg)"
+            403 -> "접근 거부(403): API 키 제한(앱 제한이면 패키지 이름·SHA-1)과 Drive API 사용 설정을 확인하세요 ($msg)"
             404 -> "폴더를 찾을 수 없어요(404): 공유가 '링크가 있는 모든 사용자'인지 확인하세요"
             else -> "오류 $code: $msg"
         }
